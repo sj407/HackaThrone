@@ -1,113 +1,118 @@
 import RPi.GPIO as GPIO
 import time
 import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation
 
-# ------------------- GPIO Setup -------------------
 TRIG = 23
 ECHO = 24
-
 GPIO.setmode(GPIO.BCM)
 GPIO.setup(TRIG, GPIO.OUT)
 GPIO.setup(ECHO, GPIO.IN)
 
-# ------------------- Sensor Function -------------------
 def get_distance():
     GPIO.output(TRIG, True)
     time.sleep(0.00001)
     GPIO.output(TRIG, False)
 
-    start_time = time.time()
-    stop_time = time.time()
+    start = time.time()
+    stop = time.time()
 
     while GPIO.input(ECHO) == 0:
-        start_time = time.time()
-
+        start = time.time()
     while GPIO.input(ECHO) == 1:
-        stop_time = time.time()
+        stop = time.time()
 
-    time_elapsed = stop_time - start_time
-    distance = (time_elapsed * 34300) / 2  # cm
+    distance = (stop - start) * 17150  # cm
+    return round(distance, 2) if 2 < distance < 200 else None
 
-    if distance < 2 or distance > 200:
-        return None
-    return round(distance, 2)
+readings = []
+baseline = None
+in_pothole = False
+pothole_start = None
+pothole_end = None
+max_depth = 0
+stable_buffer = []
+start_time = time.time()
 
-# ------------------- Data Lists -------------------
-distances = []
-x_vals = []
-reference_depth = None
-pothole_detected = False
-index = 0
-stop_flag = False
+print("Scanning started... move sensor over surface.")
 
-# ------------------- Matplotlib Setup -------------------
-plt.style.use('dark_background')
-fig, ax = plt.subplots()
-line_normal, = ax.plot([], [], 'go-', label='Normal Surface')
-line_pothole, = ax.plot([], [], 'ro-', label='Pothole Zone')
-ax.set_xlim(0, 50)
-ax.set_ylim(0, 100)
-ax.set_xlabel('Scan Step')
-ax.set_ylabel('Distance (cm)')
-ax.set_title('?? Real-time Pothole Detection Map')
-ax.legend()
+try:
+    while True:
+        # Safety timeout (25 s)
+        if time.time() - start_time > 25:
+            print("⏹ Timeout reached — stopping scan.")
+            break
 
-# ------------------- Update Function -------------------
-def update(frame):
-    global index, reference_depth, pothole_detected, stop_flag
+        dist = get_distance()
+        if dist is None:
+            continue
+        readings.append(dist)
+        print(f"Distance: {dist} cm")
 
-    if stop_flag:
-        return line_normal, line_pothole
+        # Set baseline
+        if baseline is None and len(readings) >= 5:
+            baseline = sum(readings[-5:]) / 5
+            print(f"Baseline set to {baseline:.2f} cm")
+            continue
+        if baseline is None:
+            continue
 
-    distance = get_distance()
-    if distance is None:
-        return line_normal, line_pothole
+        prev = readings[-2] if len(readings) > 1 else dist
+        diff_base = abs(dist - baseline)
+        diff_prev = abs(dist - prev)
 
-    distances.append(distance)
-    x_vals.append(index)
-    index += 1
-    print(f"Distance: {distance} cm")
+        # Detect pothole start
+        if not in_pothole and diff_base > 5 and diff_prev > 5:
+            in_pothole = True
+            pothole_start = len(readings) - 1
+            print("⚠ Pothole detected!")
 
-    # Set reference surface
-    if reference_depth is None and len(distances) > 5:
-        reference_depth = sum(distances[-5:]) / 5
-        print(f"? Reference surface set: {reference_depth:.2f} cm")
+        # Inside pothole
+        if in_pothole:
+            if diff_base > max_depth:
+                max_depth = diff_base
 
-    # Detect pothole start
-    if reference_depth and not pothole_detected and distance > reference_depth + 5:
-        pothole_detected = True
-        print("? Pothole detected! Measuring depth...")
+            # Track stability near baseline
+            stable_buffer.append(diff_base <= 3)
+            if len(stable_buffer) > 6:
+                stable_buffer.pop(0)
 
-    # Detect pothole end
-    if reference_depth and pothole_detected and abs(distance - reference_depth) <= 2:
-        print("\n? Road surface stabilized again.")
-        pothole_depth = max(distances) - reference_depth
-        print(f"?? Pothole depth: {pothole_depth:.2f} cm")
-        print("Stopping scan...\n")
-        stop_flag = True
+            # Stop if 4 of last 6 readings are stable
+            if sum(stable_buffer) >= 4:
+                pothole_end = len(readings) - 1
+                print("✅ Road stable again — pothole end.")
+                break
 
-    # Split points for visualization
-    normal_x = [x_vals[i] for i, d in enumerate(distances)
-                if reference_depth and abs(d - reference_depth) <= 5]
-    normal_y = [distances[i] for i, d in enumerate(distances)
-                if reference_depth and abs(d - reference_depth) <= 5]
+        time.sleep(0.15)  # 6–7 readings/sec
 
-    pothole_x = [x_vals[i] for i, d in enumerate(distances)
-                 if reference_depth and d > reference_depth + 5]
-    pothole_y = [distances[i] for i, d in enumerate(distances)
-                 if reference_depth and d > reference_depth + 5]
+except KeyboardInterrupt:
+    print("Stopped manually.")
+finally:
+    GPIO.cleanup()
 
-    line_normal.set_data(normal_x, normal_y)
-    line_pothole.set_data(pothole_x, pothole_y)
+# ---------- Results + Visualization ----------
+if pothole_start and pothole_end:
+    pothole_length = (pothole_end - pothole_start) * 1.5
+    print("\n========= RESULTS =========")
+    print(f"Pothole Depth: {max_depth:.2f} cm")
+    print(f"Pothole Length: {pothole_length:.2f} cm")
 
-    ax.set_xlim(0, max(50, len(x_vals)))
-    ax.set_ylim(0, max(100, max(distances) + 10))
+    if max_depth > 10:
+        safety = "❌ Dangerous — avoid!"
+    elif max_depth > 5:
+        safety = "⚠ Caution — slow down!"
+    else:
+        safety = "✅ Safe to pass."
+    print(f"Safety: {safety}")
 
-    return line_normal, line_pothole
-
-# ------------------- Run Animation -------------------
-ani = FuncAnimation(fig, update, interval=300)
-plt.show()
-
-GPIO.cleanup()
+    plt.figure(figsize=(8,3))
+    colors = ['red' if pothole_start <= i <= pothole_end else 'green'
+              for i in range(len(readings))]
+    plt.bar(range(len(readings)), readings, color=colors)
+    plt.axhline(y=baseline, color='blue', linestyle='--', label='Baseline')
+    plt.title("2D Pothole Map")
+    plt.xlabel("Reading Index")
+    plt.ylabel("Distance (cm)")
+    plt.legend()
+    plt.show()
+else:
+    print("\nNo pothole detected or insufficient data.")
